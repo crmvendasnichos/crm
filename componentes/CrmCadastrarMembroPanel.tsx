@@ -1,0 +1,257 @@
+"use client";
+import { useState } from "react";
+import ErroComVoltar from "@/componentes/ErroComVoltar";
+import { UserPlus, Loader2, KeyRound, Copy, CheckCircle2 } from "lucide-react";
+import { SENHA_PADRAO_CRM } from "@/lib/crmCadastroMembro";
+
+function mascaraCpfCnpj(valor: string): string {
+  const d = valor.replace(/\D/g, "").slice(0, 14);
+  if (d.length <= 11) {
+    return d
+      .replace(/(\d{3})(\d)/, "$1.$2")
+      .replace(/(\d{3})(\d)/, "$1.$2")
+      .replace(/(\d{3})(\d{1,2})$/, "$1-$2");
+  }
+  return d
+    .replace(/(\d{2})(\d)/, "$1.$2")
+    .replace(/(\d{3})(\d)/, "$1.$2")
+    .replace(/(\d{3})(\d)/, "$1/$2")
+    .replace(/(\d{4})(\d{1,2})$/, "$1-$2");
+}
+
+type PerfilCriado = {
+  id: string;
+  full_name: string | null;
+  email: string | null;
+  whatsapp?: string | null;
+  cpf_cnpj?: string | null;
+  role: string | null;
+  cep?: string | null;
+  logradouro?: string | null;
+  numero?: string | null;
+  complemento?: string | null;
+  bairro?: string | null;
+  municipio?: string | null;
+  uf?: string | null;
+};
+
+type Props = {
+  leadId: string;
+  nome: string;
+  emailInicial?: string | null;
+  jaTemCadastro?: boolean;
+  onCadastrado: (perfil: PerfilCriado, info?: { senha?: string; email?: string }) => void;
+  /** ID de quem indicou o lead (comissão / PRO de rede) */
+  indicadorId?: string | null;
+  apiBase?: string;
+  /** Exibe seletor Cabeleireira / Embaixadora (CRM da rede) */
+  permitirTipoMembro?: boolean;
+  accent?: "gold";
+};
+
+export default function CrmCadastrarMembroPanel({
+  leadId,
+  nome,
+  emailInicial,
+  jaTemCadastro,
+  onCadastrado,
+  apiBase = "/api/admin/crm",
+  permitirTipoMembro = false,
+  accent = "gold",
+  indicadorId = null,
+}: Props) {
+  const [nomeCadastro, setNomeCadastro] = useState(nome || "");
+  const [cpf, setCpf] = useState("");
+  const [email, setEmail] = useState(emailInicial || "");
+  const [tipoMembro, setTipoMembro] = useState<"CABELEIREIRO" | "EMBAIXADOR">("CABELEIREIRO");
+  const accentColor = "#C9A66B";
+  const [criando, setCriando] = useState(false);
+  const [erro, setErro] = useState("");
+  const [sucesso, setSucesso] = useState<{
+    email: string;
+    senha: string;
+    vinculado?: boolean;
+  } | null>(null);
+  const [copiado, setCopiado] = useState(false);
+
+  if (jaTemCadastro) return null;
+
+  async function criarCadastro() {
+    setErro("");
+    if (!nomeCadastro.trim()) {
+      setErro("Informe o nome do cliente.");
+      return;
+    }
+    const digitos = cpf.replace(/\D/g, "");
+    if (digitos && digitos.length !== 11 && digitos.length !== 14) {
+      setErro("CPF deve ter 11 dígitos ou CNPJ 14 dígitos.");
+      return;
+    }
+    setCriando(true);
+    try {
+      const res = await fetch(`${apiBase}/leads/${leadId}/cadastrar-membro`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          nome: nomeCadastro.trim(),
+          cpf_cnpj: cpf.replace(/\D/g, ""),
+          email: email.trim(),
+          indicador_id: indicadorId,
+          ...(permitirTipoMembro ? { role_membro: tipoMembro } : {}),
+        }),
+      });
+      const d = await res.json().catch(() => null);
+      if (!res.ok || !d?.ok) {
+        setErro(d?.error || "Erro ao criar cadastro.");
+        return;
+      }
+      const perfil = d.perfil as PerfilCriado;
+      const info = {
+        email: d.email || perfil?.email || email,
+        senha: d.senha_temporaria || SENHA_PADRAO_CRM,
+        vinculado: Boolean(d.vinculado_existente),
+      };
+      setSucesso(info);
+      if (perfil) onCadastrado(perfil, info);
+    } finally {
+      setCriando(false);
+    }
+  }
+
+  async function copiarSenha() {
+    if (!sucesso) return;
+    try {
+      await navigator.clipboard.writeText(
+        `E-mail: ${sucesso.email}\nSenha: ${sucesso.senha}`
+      );
+      setCopiado(true);
+      setTimeout(() => setCopiado(false), 2000);
+    } catch {
+      /* ignora */
+    }
+  }
+
+  const inputClass =
+    "w-full bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2 text-sm text-white outline-none focus:border-[#C9A66B]";
+
+  if (sucesso) {
+    return (
+      <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-4 space-y-2">
+        <div className="flex items-center gap-2 text-emerald-300 font-bold text-sm">
+          <CheckCircle2 size={16} />
+          {sucesso.vinculado ? "Cadastro existente vinculado!" : "Cadastro criado no app!"}
+        </div>
+        {!sucesso.vinculado && (
+          <>
+            <p className="text-xs text-zinc-400">
+              Envie os dados de acesso para <strong className="text-white">{nome}</strong>:
+            </p>
+            <div className="flex items-center gap-2 text-xs bg-black/40 rounded-lg px-3 py-2 font-mono">
+              <KeyRound size={12} className="text-[#C9A66B] shrink-0" />
+              <span className="text-zinc-300 truncate">{sucesso.email}</span>
+              <span className="text-zinc-600">·</span>
+              <span className="text-[#C9A66B]">{sucesso.senha}</span>
+            </div>
+            <button
+              type="button"
+              onClick={copiarSenha}
+              className="text-[10px] font-black uppercase tracking-widest text-zinc-400 hover:text-white flex items-center gap-1"
+            >
+              {copiado ? <CheckCircle2 size={12} /> : <Copy size={12} />}
+              {copiado ? "Copiado!" : "Copiar acesso"}
+            </button>
+            <p className="text-[10px] text-zinc-500">
+              A cliente pode alterar a senha ao entrar no app pela primeira vez.
+            </p>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/50 p-4 space-y-3">
+      <div className="flex items-center gap-2 text-sm font-bold text-white">
+        <UserPlus size={16} style={{ color: accentColor }} />
+        {permitirTipoMembro ? "Cadastrar na rede antes do app" : "Sem cadastro no app"}
+      </div>
+      <p className="text-[11px] text-zinc-500">
+        {permitirTipoMembro
+          ? "Crie o acesso como cabeleireira ou nova embaixadora da sua rede. Senha temporária:"
+          : "Crie a conta com senha temporária"}{" "}
+        <span className="text-zinc-400 font-mono">{SENHA_PADRAO_CRM}</span>
+        {permitirTipoMembro ? "" : " para a cliente acessar depois."}
+      </p>
+      {permitirTipoMembro && (
+        <div className="flex gap-2">
+          {(["CABELEIREIRO", "EMBAIXADOR"] as const).map((t) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => setTipoMembro(t)}
+              className={`flex-1 text-[10px] font-black uppercase tracking-widest py-2 rounded-lg border transition-all ${
+                tipoMembro === t
+                  ? "border-[#C9A66B]/50 bg-[#C9A66B]/15 text-[#C9A66B]"
+                  : "border-zinc-700 text-zinc-500 hover:border-zinc-600"
+              }`}
+            >
+              {t === "CABELEIREIRO" ? "Cabeleireira" : "Embaixadora"}
+            </button>
+          ))}
+        </div>
+      )}
+      <div>
+        <label className="block text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-1">
+          Nome do cliente *
+        </label>
+        <input
+          value={nomeCadastro}
+          onChange={(e) => setNomeCadastro(e.target.value)}
+          placeholder="Nome que aparece no pedido"
+          className={inputClass}
+        />
+      </div>
+      <div>
+        <label className="block text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-1">
+          CPF / CNPJ
+        </label>
+        <input
+          value={cpf}
+          onChange={(e) => setCpf(mascaraCpfCnpj(e.target.value))}
+          placeholder="000.000.000-00"
+          inputMode="numeric"
+          className={inputClass}
+        />
+      </div>
+      {erro && (
+        <ErroComVoltar
+          compacto
+          mensagem={erro}
+          onVoltar={() => setErro("")}
+          rotuloVoltar="Fechar"
+        />
+      )}
+      <div>
+        <label className="block text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-1">
+          E-mail para login *
+        </label>
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="email@exemplo.com"
+          className={inputClass}
+        />
+      </div>
+      <button
+        type="button"
+        onClick={criarCadastro}
+        disabled={criando || !email.trim() || !nomeCadastro.trim()}
+        className="w-full bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 border border-zinc-700 text-white font-black uppercase text-[10px] tracking-widest py-2.5 rounded-xl flex items-center justify-center gap-2"
+      >
+        {criando ? <Loader2 size={14} className="animate-spin" /> : <UserPlus size={14} />}
+        {criando ? "Criando..." : permitirTipoMembro ? `Criar ${tipoMembro === "EMBAIXADOR" ? "embaixadora" : "cabeleireira"}` : "Criar cadastro no app"}
+      </button>
+    </div>
+  );
+}

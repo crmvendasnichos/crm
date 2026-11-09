@@ -1,0 +1,156 @@
+import { NextRequest, NextResponse } from "next/server";
+import { getAdminContext } from "@/lib/adminServer";
+import { assertVendedorCrmAccess } from "@/lib/crmVendedorServer";
+import { garantirLeadPipeline } from "@/lib/crmVisitaPipeline";
+
+export const dynamic = "force-dynamic";
+
+const TIPOS = new Set(["visita", "demo", "amostra", "followup"]);
+const RESULTADOS = new Set(["positivo", "neutro", "negativo", "reagendar"]);
+
+export async function GET(req: NextRequest) {
+  const { supabase, userId, error: authErr, status } = await getAdminContext();
+  if (!supabase || !userId) {
+    return NextResponse.json({ ok: false, error: authErr }, { status });
+  }
+
+  const access = await assertVendedorCrmAccess(supabase, userId);
+  if (!access.ok) {
+    return NextResponse.json({ ok: false, error: access.error }, { status: 403 });
+  }
+
+  const mes = req.nextUrl.searchParams.get("periodo") || new Date().toISOString().slice(0, 7);
+  const ini = `${mes}-01`;
+  const fimDate = new Date(
+    new Date(`${mes}-01`).getFullYear(),
+    new Date(`${mes}-01`).getMonth() + 1,
+    0
+  );
+  const fim = `${fimDate.toISOString().slice(0, 10)}T23:59:59`;
+
+  let query = supabase
+    .from("crm_visitas")
+    .select("*")
+    .eq("vendedor_id", userId)
+    .gte("data_visita", ini)
+    .lte("data_visita", fim)
+    .order("data_visita", { ascending: false });
+
+  const tipo = req.nextUrl.searchParams.get("tipo");
+  if (tipo && TIPOS.has(tipo)) query = query.eq("tipo", tipo);
+
+  const { data, error } = await query;
+  if (error) {
+    const msg = error.message || "Falha ao carregar visitas.";
+    const dica =
+      /permission denied|crm_visitas/i.test(msg)
+        ? " Rode supabase/fix_crm_visitas_grants.sql no SQL Editor do Supabase."
+        : msg.includes("crm_visitas")
+          ? " Rode supabase/crm_vendedor_visitas_metas.sql"
+          : "";
+    return NextResponse.json({ ok: false, error: msg + dica }, { status: 500 });
+  }
+
+  return NextResponse.json({ ok: true, visitas: data || [] });
+}
+
+export async function POST(req: NextRequest) {
+  const { supabase, userId, error: authErr, status } = await getAdminContext();
+  if (!supabase || !userId) {
+    return NextResponse.json({ ok: false, error: authErr }, { status });
+  }
+
+  const access = await assertVendedorCrmAccess(supabase, userId);
+  if (!access.ok) {
+    return NextResponse.json({ ok: false, error: access.error }, { status: 403 });
+  }
+
+  const body = await req.json().catch(() => null);
+  const tipo = String(body?.tipo || "visita").toLowerCase();
+  const clienteNome = String(body?.cliente_nome || "").trim();
+
+  if (!clienteNome) {
+    return NextResponse.json({ ok: false, error: "Nome do cliente é obrigatório." }, { status: 400 });
+  }
+  if (!TIPOS.has(tipo)) {
+    return NextResponse.json({ ok: false, error: "Tipo de visita inválido." }, { status: 400 });
+  }
+
+  const resultado = body?.resultado ? String(body.resultado).toLowerCase() : null;
+  if (resultado && !RESULTADOS.has(resultado)) {
+    return NextResponse.json({ ok: false, error: "Resultado inválido." }, { status: 400 });
+  }
+
+  const telefone = body?.cliente_telefone?.trim() || null;
+  const cidade = body?.cliente_cidade?.trim() || null;
+  const proximoPasso = body?.proximo_passo?.trim() || null;
+  const notas = body?.notas?.trim() || null;
+  const profileId = body?.profile_id ? String(body.profile_id) : null;
+  const crmLeadIdBody = body?.crm_lead_id ? String(body.crm_lead_id) : null;
+
+  const leadRes = await garantirLeadPipeline(supabase, {
+    userId,
+    vendedorNome: access.full_name || "vendedor",
+    crmLeadId: crmLeadIdBody,
+    profileId,
+    nome: clienteNome,
+    telefone,
+    cidade,
+    resultado,
+    proximoPasso,
+    tipo,
+    notas,
+  });
+
+  if ("error" in leadRes) {
+    return NextResponse.json({ ok: false, error: leadRes.error }, { status: 500 });
+  }
+
+  const row = {
+    vendedor_id: userId,
+    distribuidor_id: access.distribuidor_id,
+    crm_lead_id: leadRes.leadId,
+    tipo,
+    cliente_nome: clienteNome,
+    cliente_telefone: telefone,
+    cliente_cidade: cidade,
+    data_visita: body?.data_visita || new Date().toISOString(),
+    produtos_amostra: body?.produtos_amostra?.trim() || null,
+    resultado,
+    proximo_passo: proximoPasso,
+    notas,
+  };
+
+  const { data: visita, error } = await supabase.from("crm_visitas").insert(row).select().single();
+  if (error) {
+    const msg = error.message || "Falha ao registrar visita.";
+    const dica =
+      /permission denied|crm_visitas/i.test(msg)
+        ? " Rode supabase/fix_crm_visitas_grants.sql no SQL Editor do Supabase."
+        : "";
+    return NextResponse.json({ ok: false, error: msg + dica }, { status: 500 });
+  }
+
+  const detalhe = [
+    `Visita em campo (${tipo}): ${clienteNome}`,
+    resultado ? `resultado ${resultado}` : null,
+    proximoPasso ? `próximo: ${proximoPasso}` : null,
+    notas || null,
+  ]
+    .filter(Boolean)
+    .join(" — ");
+
+  await supabase.from("crm_atividades").insert({
+    lead_id: leadRes.leadId,
+    autor_id: userId,
+    tipo: "contato",
+    conteudo: detalhe,
+  });
+
+  return NextResponse.json({
+    ok: true,
+    visita,
+    lead_id: leadRes.leadId,
+    lead_criado: leadRes.criado,
+  });
+}

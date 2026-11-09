@@ -1,0 +1,2 @@
+-- Deprecado em favor do script completo (inclui GRANTs + SELECT).
+-- Use: supabase/fix_products_admin_completo.sql (execute no SQL Editor do Supabase).

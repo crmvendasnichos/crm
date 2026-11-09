@@ -1,0 +1,621 @@
+"use client";
+
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+import { useEffect, useState } from "react";
+import { createClientComponentClient } from "@supabase/auth-helpers-nextjs";
+import { useParams, useRouter } from "next/navigation";
+import { ArrowLeft, Loader2, Play, CheckCircle, Lock, Trophy, MessageSquare, Send, User, Bookmark, Reply, X } from "lucide-react";
+import Link from "next/link";
+import { formatDistanceToNow } from 'date-fns';
+import { ptBR } from 'date-fns/locale';
+import LessonYoutubePlayer from "@/componentes/LessonYoutubePlayer";
+
+export default function PlayerPage() {
+  const params = useParams();
+  const router = useRouter();
+  const supabase = createClientComponentClient();
+  
+  const [loading, setLoading] = useState(true);
+  const [course, setCourse] = useState<any>(null);
+  const [lessons, setLessons] = useState<any[]>([]);
+  const [currentLesson, setCurrentLesson] = useState<any>(null);
+  const [completedLessons, setCompletedLessons] = useState<Set<string>>(new Set());
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [concluidas, setConcluidas] = useState<string[]>([]);
+  
+  const [videoStarted, setVideoStarted] = useState(false);
+
+  const [currentUser, setCurrentUser] = useState<any>(null);
+  const [activeTab, setActiveTab] = useState<'sobre' | 'materiais' | 'duvidas'>('sobre');
+  const [comments, setComments] = useState<any[]>([]);
+  const [newComment, setNewComment] = useState("");
+  const [replyingTo, setReplyingTo] = useState<{id: string, name: string} | null>(null);
+  const [isSending, setIsSending] = useState(false);
+
+  const [allUsers, setAllUsers] = useState<any[]>([]);
+  const [showMentionList, setShowMentionList] = useState(false);
+  const [mentionQuery, setMentionQuery] = useState("");
+  const [loadingResposta, setLoadingResposta] = useState(false);
+  const [respostasTexto, setRespostasTexto] = useState<Record<string, string>>({});
+  const [mostrandoResposta, setMostrandoResposta] = useState<string | null>(null);
+  const [respostas, setRespostas] = useState<any[]>([]);
+  // Estado para guardar os IDs dos comentários que estão "abertos"
+  const [comentariosAbertos, setComentariosAbertos] = useState<string[]>([]);
+
+  useEffect(() => {
+    setVideoStarted(false);
+  }, [currentLesson?.id]);
+
+  const courseKey = String(params.code || "").trim();
+
+  useEffect(() => {
+    if (!courseKey) {
+      setLoadError("Módulo inválido.");
+      setLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    async function loadData() {
+      setLoading(true);
+      setLoadError(null);
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        const userId = session?.user?.id;
+
+        if (session?.user) {
+          setCurrentUser(session.user);
+          const { data: profiles } = await supabase
+            .from("profiles")
+            .select("id, full_name, avatar_url");
+          if (!cancelled) setAllUsers(profiles || []);
+        }
+
+        const codeFilter = courseKey.replace(/,/g, "");
+        const { data: courseData, error: courseErr } = await supabase
+          .from("courses")
+          .select("*")
+          .or(`code.eq.${codeFilter},slug.eq.${codeFilter}`)
+          .maybeSingle();
+
+        if (courseErr) throw courseErr;
+        if (!courseData?.code) {
+          if (!cancelled) {
+            setCourse(null);
+            setLessons([]);
+            setCurrentLesson(null);
+            setLoadError("Módulo não encontrado.");
+          }
+          return;
+        }
+
+        const { data: lessonsData } = await supabase
+          .from("lessons")
+          .select("*")
+          .eq("course_code", courseData.code)
+          .order("sequence_order", { ascending: true });
+
+        const { data: progress } = userId
+          ? await supabase.from("lesson_progress").select("lesson_id").eq("user_id", userId)
+          : { data: null };
+
+        const { data: userProg } = userId
+          ? await supabase.from("user_progress").select("lesson_id").eq("user_id", userId)
+          : { data: null };
+
+        if (cancelled) return;
+
+        setCourse(courseData);
+        setLessons(lessonsData || []);
+        const completedSet = new Set<string>();
+        progress?.forEach((p: { lesson_id: string }) => completedSet.add(p.lesson_id));
+        setCompletedLessons(completedSet);
+        setConcluidas((userProg || []).map((p: { lesson_id: string }) => p.lesson_id));
+        setCurrentLesson(lessonsData?.[0] ?? null);
+      } catch (e) {
+        console.error(e);
+        if (!cancelled) setLoadError("Não foi possível carregar o módulo. Tente novamente.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    void loadData();
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.user && !cancelled) void loadData();
+    });
+
+    return () => {
+      cancelled = true;
+      subscription.unsubscribe();
+    };
+  }, [courseKey, supabase]);
+
+  useEffect(() => {
+    if (currentLesson?.id) loadComments();
+  }, [currentLesson]);
+
+  const fetchRespostas = async () => {
+    const { data, error } = await supabase
+      .from('lesson_comment_replies')
+      .select('*')
+      .order('created_at', { ascending: true });
+
+    if (!error && data) {
+      setRespostas(data);
+    }
+  };
+
+  async function loadComments() {
+    const { data } = await supabase.from('lesson_comments').select('*, profiles(full_name, avatar_url)').eq('lesson_id', currentLesson.id).order('created_at', { ascending: false });
+    setComments(data || []);
+    // Carrega as respostas junto com os comentários
+    fetchRespostas();
+  }
+
+  const formatTime = (seconds: number) => {
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  // --- MARCAR AULA COMO ASSISTIDA (user_progress) ---
+  const finalizarAula = async (lessonId: string) => {
+    if (!currentUser) return;
+
+    const { error } = await supabase
+      .from('user_progress')
+      .upsert({ 
+        user_id: currentUser.id, 
+        lesson_id: lessonId, 
+        completed: true 
+      });
+
+    if (!error) {
+      console.log("Progresso salvo com sucesso!");
+      // Agora a tabela user_progress não estará mais vazia!
+      setConcluidas(prev =>
+        prev.includes(lessonId) ? prev : [...prev, lessonId]
+      );
+    }
+  };
+
+  const handleFinish = async () => {
+    await supabase.rpc("process_lesson_completion", { lesson_uuid: currentLesson.id });
+    await finalizarAula(currentLesson.id);
+    const newSet = new Set(completedLessons);
+    newSet.add(currentLesson.id);
+    setCompletedLessons(newSet);
+    router.refresh();
+  };
+
+  const handleCommentChange = (e: any) => {
+    const text = e.target.value;
+    setNewComment(text);
+    const words = text.split(/\s/);
+    const lastWord = words[words.length - 1];
+    if (lastWord.startsWith("@")) {
+      setMentionQuery(lastWord.substring(1));
+      setShowMentionList(true);
+      // Mostra o menu de usuários para marcar
+    } else {
+      setShowMentionList(false);
+    }
+  };
+
+  const selectUser = (name: string) => {
+    const words = newComment.split(/\s/);
+    words.pop();
+    setNewComment([...words, `@${name} `].join(" "));
+    setShowMentionList(false);
+  };
+
+  // Função para abrir/fechar respostas
+  const toggleRespostas = (id: string) => {
+    setComentariosAbertos(prev => 
+      prev.includes(id) ? prev.filter(cid => cid !== id) : [...prev, id]
+    );
+  };
+
+  const handlePostComment = async () => {
+    if (!newComment.trim() || !currentUser) return;
+    setIsSending(true);
+    const { error } = await supabase.from('lesson_comments').insert({
+      lesson_id: currentLesson.id,
+      user_id: currentUser.id,
+      content: replyingTo ? `@${replyingTo.name} ${newComment}` : newComment.trim(), // Adiciona o @ no texto
+      parent_id: replyingTo?.id || null // Se for resposta, salva o ID do pai
+    });
+    if (!error) {
+      setNewComment("");
+      setReplyingTo(null);
+      loadComments(); // Atualiza a lista de dúvidas
+    }
+    setIsSending(false);
+  };
+
+  const handleEnviarResposta = async (comentarioOriginal: any, textoDaResposta: string) => {
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+
+      // 1. SALVAR A RESPOSTA (O que você já faz)
+      const { data: novaResposta, error: errorResposta } = await supabase
+        .from("lesson_comment_replies")
+        .insert([{
+          comment_id: comentarioOriginal.id,
+          user_id: user?.id,
+          user_name: user?.user_metadata.full_name,
+          content: textoDaResposta
+        }])
+        .select().single();
+
+      if (errorResposta) throw errorResposta;
+
+      // 2. ATUALIZAR A TELA NA HORA
+      setRespostas(prev => [...prev, novaResposta]);
+      setRespostasTexto({ ...respostasTexto, [comentarioOriginal.id]: "" });
+      setMostrandoResposta(null); // Fecha o campo de digitar
+
+      // 3. CRIAR NOTIFICAÇÃO (Usando sua tabela existente)
+      // Só notifica se não for você respondendo a você mesmo
+      if (comentarioOriginal.user_id !== user?.id) {
+        await supabase
+          .from("notifications")
+          .insert([{
+            user_id: comentarioOriginal.user_id, // Quem recebe
+            actor_id: user?.id, // Quem respondeu
+            type: 'comment',
+            content: `respondeu seu comentário: "${textoDaResposta.substring(0, 20)}..."`,
+            link: `/evolucao/${params.code}`, // Link para a aula específica
+            read: false
+          }]);
+      }
+
+    } catch (err) {
+      console.error("Erro no processo:", err);
+    }
+  };
+
+  // ATENÇÃO: Se a sua página recebe (props) ou ({ params }), garanta que 'params' está acessível.
+  const aoTerminar = async () => {
+    console.log("--- INICIANDO TESTE DO BOTÃO ---");
+    
+    if (!currentUser?.id) {
+      alert("❌ ERRO: Usuário não identificado. Você está logado?");
+      return;
+    }
+
+    try {
+      console.log("Salvando progresso da aula:", params.code);
+      
+      // 1. Salva a aula usando o "code" da URL (ex: MOD_VENDAS)
+      const { error: erroProgresso } = await supabase.from('lesson_progress').upsert({
+        user_id: currentUser.id,
+        lesson_id: params.code, // <--- AQUI ESTAVA O SEGREDO! Usa params.code
+        completed: true
+      });
+
+      if (erroProgresso) {
+        alert("❌ Erro do Supabase ao salvar aula: " + erroProgresso.message);
+        return;
+      }
+      
+      // 2. Lê as moedas do usuário
+      const { data: perfil, error: erroBusca } = await supabase
+        .from('profiles')
+        .select('personal_coins')
+        .eq('id', currentUser.id)
+        .single();
+
+      if (erroBusca) {
+        alert("❌ Erro ao ler moedas: " + erroBusca.message);
+        return;
+      }
+
+      // 3. Adiciona 50 moedas
+      const novoSaldo = (perfil?.personal_coins || 0) + 50;
+      const { error: erroUpdate } = await supabase
+        .from('profiles')
+        .update({ personal_coins: novoSaldo })
+        .eq('id', currentUser.id);
+
+      if (erroUpdate) {
+        alert("❌ Erro ao pagar moedas: " + erroUpdate.message);
+        return;
+      }
+
+      // Sucesso total
+      alert("🔥 SUCESSO! Aula " + params.code + " salva e 50 Moedas PRO adicionadas!");
+      
+    } catch (err) {
+      alert("❌ Erro fatal no código. Aperte F12 e olhe a aba Console.");
+      console.error(err);
+    }
+  };
+
+  const getMaterialLinks = (materialValue: any): string[] => {
+    if (!materialValue) return [];
+    if (Array.isArray(materialValue)) {
+      return materialValue.map((item) => String(item).trim()).filter(Boolean);
+    }
+    if (typeof materialValue === "string") {
+      return materialValue
+        .split(/\r?\n|,|;/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+    return [String(materialValue).trim()].filter(Boolean);
+  };
+
+  const materialLinks = getMaterialLinks(currentLesson?.material_url);
+
+  if (loading) {
+    return (
+      <div className="h-screen bg-black flex items-center justify-center">
+        <Loader2 className="animate-spin text-[#C9A66B]" />
+      </div>
+    );
+  }
+
+  if (loadError || !course) {
+    return (
+      <div className="min-h-screen bg-black flex flex-col items-center justify-center gap-4 p-6 text-center">
+        <p className="text-zinc-400">{loadError || "Módulo não encontrado."}</p>
+        <Link href="/evolucao" className="text-[#C9A66B] text-sm font-bold uppercase tracking-widest hover:underline">
+          Voltar à Evolução
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-[#050505] text-zinc-300 font-sans selection:bg-[#C9A66B]/30">
+      {/* HEADER (TEXTO REFINADO) */}
+      <header className="h-16 px-8 flex items-center justify-between border-b border-white/5 bg-black/40 backdrop-blur-md sticky top-0 z-50">
+        <Link href="/evolucao" className="flex items-center gap-3 text-zinc-500 hover:text-white transition-all">
+          <ArrowLeft size={16} />
+          <span className="text-[10px] font-bold uppercase tracking-widest italic">Voltar</span>
+        </Link>
+        <div className="flex flex-col items-center text-center">
+          <span className="text-[9px] text-zinc-600 font-medium uppercase tracking-[0.4em] mb-1">Módulo</span>
+          <span className="text-[11px] font-medium text-[#C9A66B] uppercase tracking-[0.2em] italic max-w-[150px] md:max-w-none truncate">{course?.title}</span>
+        </div>
+        <div className="w-10"></div>
+      </header>
+
+      <div className="flex flex-col lg:flex-row flex-1 overflow-hidden">
+        <div className="flex-1 overflow-y-auto p-4 md:p-10 custom-scrollbar">
+          <div className="max-w-5xl mx-auto">
+            
+            {/* PLAYER NINJA (CORRIGIDO PARA TOUCH) */}
+            <div className="aspect-video w-full bg-black rounded-xl overflow-hidden border border-white/5 relative group shadow-2xl">
+              <LessonYoutubePlayer
+                lesson={currentLesson}
+                started={videoStarted}
+                onStart={() => setVideoStarted(true)}
+              />
+            </div>
+
+            {/* TITULO E ABAS (VISUAL MANTIDO) */}
+            <div className="mt-8 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4 mb-12">
+                <h1 className="text-xl md:text-2xl font-semibold text-white tracking-tight italic uppercase">{currentLesson?.title}</h1>
+                <div className="flex flex-wrap items-center gap-3">
+                  {currentLesson && !completedLessons.has(currentLesson.id) && (
+                    <button
+                      type="button"
+                      onClick={() => void handleFinish()}
+                      className="px-4 py-2 rounded-xl bg-[#C9A66B] text-black text-[10px] font-black uppercase tracking-widest"
+                    >
+                      Concluir aula
+                    </button>
+                  )}
+                  <div className="flex items-center gap-3 px-6 py-2.5 rounded-xl text-[10px] font-bold border border-[#C9A66B]/20 bg-[#C9A66B]/5">
+                    <Trophy size={14} className="text-[#C9A66B]" /> {completedLessons.has(currentLesson?.id) ? "PRO ADQUIRIDO" : "+10 PRO"}
+                  </div>
+                </div>
+            </div>
+
+            <div className="mt-8 border-t border-white/5 pt-8">
+                <div className="flex gap-6 md:gap-10 mb-8 overflow-x-auto no-scrollbar">
+                    {['sobre', 'materiais', 'duvidas'].map((t) => (
+                        <button key={t} onClick={() => setActiveTab(t as any)} className={`text-[10px] font-bold uppercase tracking-[0.2em] pb-2 transition-all border-b-2 whitespace-nowrap ${activeTab === t ? 'text-[#C9A66B] border-[#C9A66B]' : 'text-zinc-600 border-transparent'}`}>{t}</button>
+                    ))}
+                </div>
+                
+                {/* CONTEÚDO DAS ABAS (MANTIDO) */}
+
+                <div className="min-h-[200px]">
+                    {activeTab === 'sobre' && (
+                        <div className="max-w-3xl bg-white/[0.03] border border-white/[0.05] rounded-2xl p-6">
+                            <h2 className="text-xs font-bold uppercase tracking-[0.2em] text-[#C9A66B] mb-4">Sobre a aula</h2>
+                            {currentLesson?.description ? (
+                                <p className="text-sm text-zinc-300 leading-relaxed whitespace-pre-line">
+                                    {currentLesson.description}
+                                </p>
+                            ) : (
+                                <p className="text-sm text-zinc-500">
+                                    Esta aula ainda não possui descrição cadastrada.
+                                </p>
+                            )}
+                        </div>
+                    )}
+
+                    {activeTab === 'materiais' && (
+                        <div className="max-w-3xl bg-white/[0.03] border border-white/[0.05] rounded-2xl p-6">
+                            <h2 className="text-xs font-bold uppercase tracking-[0.2em] text-[#C9A66B] mb-4">Materiais</h2>
+                            {materialLinks.length > 0 ? (
+                                <div className="space-y-3">
+                                    {materialLinks.map((url, index) => (
+                                        <a
+                                            key={`${url}-${index}`}
+                                            href={url}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="block w-full bg-zinc-900/40 border border-white/10 rounded-xl px-4 py-3 text-sm text-zinc-200 hover:border-[#C9A66B]/50 hover:text-white transition-colors break-all"
+                                        >
+                                            {url}
+                                        </a>
+                                    ))}
+                                </div>
+                            ) : (
+                                <p className="text-sm text-zinc-500">
+                                    Esta aula ainda não possui materiais cadastrados.
+                                </p>
+                            )}
+                        </div>
+                    )}
+
+                    {activeTab === 'duvidas' && (
+                        <div className="max-w-3xl relative">
+                            <div className="relative mb-10">
+                                {replyingTo && (
+                                    <div className="flex items-center justify-between bg-[#C9A66B]/10 border border-[#C9A66B]/20 p-3 rounded-t-xl mb-[-1px]">
+                                        <span className="text-[10px] font-bold text-[#C9A66B] uppercase tracking-widest">Respondendo a {replyingTo.name}</span>
+                                        <button onClick={() => setReplyingTo(null)} className="text-[#C9A66B]"><X size={14}/></button>
+                                    </div>
+                                )}
+                                <div className="relative">
+                                    <textarea value={newComment} onChange={handleCommentChange} placeholder="Tire sua dúvida... use @ para marcar" className={`w-full bg-zinc-900/30 border border-white/5 p-5 text-sm focus:border-[#C9A66B]/30 outline-none min-h-[100px] resize-none transition-all ${replyingTo ? 'rounded-b-xl' : 'rounded-xl'}`} />
+                                    <button onClick={handlePostComment} disabled={isSending} className="absolute bottom-5 right-5 p-2.5 bg-[#C9A66B] rounded-lg text-black disabled:opacity-50">
+                                        {isSending ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+                                    </button>
+                                </div>
+                                
+                                {/* MENU DE MENÇÃO (Aparece se digitar @) */}
+                                {showMentionList && mentionQuery !== null && (
+                                    <div className="absolute bottom-full mb-2 bg-zinc-900 border border-white/10 w-64 rounded-xl shadow-2xl z-50 overflow-hidden max-h-48 overflow-y-auto">
+                                        <p className="p-3 text-[10px] text-zinc-500 font-bold uppercase border-b border-white/5">Marcar usuário...</p>
+                                        {allUsers.filter(u => u.full_name?.toLowerCase().includes(mentionQuery.toLowerCase())).length > 0 ? (
+                                            allUsers.filter(u => u.full_name?.toLowerCase().includes(mentionQuery.toLowerCase())).map(user => (
+                <button
+                                                    key={user.id} 
+                                                    onClick={() => selectUser(user.full_name)} 
+                                                    className="w-full text-left px-4 py-3 hover:bg-zinc-800 flex items-center gap-3 text-sm border-b border-white/5 last:border-0 transition-colors"
+                                                >
+                                                    <div className="w-6 h-6 rounded-full bg-zinc-800 overflow-hidden flex items-center justify-center border border-white/10">
+                                                        {user.avatar_url ? (
+                                                            <img src={user.avatar_url} className="w-full h-full object-cover" />
+                                                        ) : (
+                                                            <User size={12} className="text-zinc-500" />
+                                                        )}
+                                                    </div>
+                                                    <span className="truncate font-medium text-zinc-300">{user.full_name}</span>
+                                                </button>
+                                            ))
+                                        ) : (
+                                            <div className="px-4 py-2 text-xs text-zinc-500">Ninguém encontrado...</div>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                            {/* LISTA DE DÚVIDAS (MANTIDA COM SCROLL) */}
+                            <div className="space-y-6 max-h-[600px] overflow-y-auto pr-2 custom-scrollbar">
+                                {comments.filter(c => !c.parent_id).map((c) => (
+                                    <div key={c.id} className="space-y-4">
+                                        <div className="flex gap-4 p-5 rounded-2xl bg-white/[0.03] border border-white/[0.02]">
+                                            <div className="w-10 h-10 rounded-full bg-zinc-900 border border-white/5 flex items-center justify-center font-bold text-xs shrink-0">
+                                                {c.profiles?.avatar_url ? <img src={c.profiles.avatar_url} className="rounded-full w-full h-full object-cover" /> : c.profiles?.full_name?.[0]}
+                                            </div>
+                                            <div className="flex-1">
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <span className="text-xs font-bold text-white uppercase">{c.profiles?.full_name}</span>
+                                                    <span className="text-[9px] text-zinc-600 font-black uppercase">{formatDistanceToNow(new Date(c.created_at), { locale: ptBR, addSuffix: true })}</span>
+                  </div>
+                                                <p className="text-sm text-zinc-400 leading-relaxed">
+                                                    {c.content.split(" ").map((word: string, i: number) => 
+                                                        word.startsWith("@") ? (
+                                                            <span key={i} className="text-[#C9A66B] font-bold">{word} </span>
+                                                        ) : (
+                                                            word + " "
+                                                        )
+                                                    )}
+                                                </p>
+                                                <button onClick={() => { setMostrandoResposta(mostrandoResposta === c.id ? null : c.id); }} className="flex items-center gap-2 text-[9px] font-black uppercase tracking-[0.2em] text-[#C9A66B] mt-4 hover:underline">
+                                                    <Reply size={12} /> Responder
+                                                </button>
+                                                
+                                                {/* 1. O CONTADOR (Só aparece se houver respostas) */}
+                                                {respostas.filter(r => r.comment_id === c.id).length > 0 && (
+                                                  <button 
+                                                    onClick={() => toggleRespostas(c.id)}
+                                                    className="flex items-center gap-2 mt-2 text-[#C9A66B] hover:text-[#e2bc7d] text-xs font-bold transition-all"
+                                                  >
+                                                    <span className="bg-[#C9A66B]/10 px-2 py-0.5 rounded-full border border-[#C9A66B]/20">
+                                                      {respostas.filter(r => r.comment_id === c.id).length} respostas
+                                                    </span>
+                                                    {comentariosAbertos.includes(c.id) ? '▼ Recolher' : '▶ Ver respostas'}
+                                                  </button>
+                                                )}
+
+                                                {/* 2. AS RESPOSTAS (Escondidas por padrão) */}
+                                                {comentariosAbertos.includes(c.id) && (
+                                                  <div className="ml-10 mt-3 space-y-3 border-l-2 border-[#C9A66B]/30 pl-4 animate-in fade-in slide-in-from-top-1 duration-300">
+                                                    {respostas
+                                                      .filter(r => r.comment_id === c.id)
+                                                      .map(resp => (
+                                                        <div key={resp.id} className="bg-zinc-900/60 p-3 rounded-lg border-l border-[#C9A66B]">
+                                                          <div className="flex justify-between items-center mb-1">
+                                                            <span className="text-[#C9A66B] font-bold text-[11px]">{resp.user_name}</span>
+                                                            <span className="text-gray-500 text-[9px]">
+                                                              {new Date(resp.created_at).toLocaleDateString()}
+                                                            </span>
+                                                          </div>
+                                                          <p className="text-gray-300 text-sm leading-relaxed">{resp.content}</p>
+                                                        </div>
+                                                      ))
+                                                    }
+                                                  </div>
+                                                )}
+                                                
+                                                {/* Campo de resposta (aparece quando clica em Responder) */}
+                                                {mostrandoResposta === c.id && (
+                                                    <div className="mt-4 space-y-2">
+                                                        <textarea
+                                                            value={respostasTexto[c.id] || ""}
+                                                            onChange={(e) => setRespostasTexto({ ...respostasTexto, [c.id]: e.target.value })}
+                                                            placeholder="Escreva sua resposta..."
+                                                            className="w-full bg-zinc-900/30 border border-white/5 p-3 text-sm focus:border-[#C9A66B]/30 outline-none min-h-[80px] resize-none rounded-xl"
+                                                        />
+                                                        <button
+                                                            disabled={loadingResposta}
+                                                            onClick={() => handleEnviarResposta(c, respostasTexto[c.id] || "")}
+                                                            className="text-[#C9A66B] hover:underline text-xs font-bold disabled:opacity-50 disabled:cursor-not-allowed"
+                                                        >
+                                                            {loadingResposta ? "Enviando..." : "POSTAR RESPOSTA"}
+                                                        </button>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                  </div>
+            </div>
+          </div>
+        </div>
+
+        {/* LISTA LATERAL (MANTIDA) */}
+        <div className="w-full lg:w-80 bg-black border-l border-white/5 overflow-y-auto shrink-0">
+            <div className="p-6 border-b border-white/5 sticky top-0 bg-black z-10"><h3 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest italic">Aulas</h3></div>
+            {lessons.map((lesson, idx) => {
+                const isActive = currentLesson?.id === lesson.id;
+                const isUnlocked = idx === 0 || completedLessons.has(lessons[idx - 1].id);
+                return (
+                    <button key={lesson.id} disabled={!isUnlocked} onClick={() => setCurrentLesson(lesson)} className={`w-full p-6 text-left flex gap-4 border-b border-white/5 transition-all ${isActive ? 'bg-zinc-900 border-l-2 border-[#C9A66B]' : ''} ${!isUnlocked ? 'opacity-20' : 'hover:bg-zinc-900/50'}`}>
+                        <div className="mt-1">{!isUnlocked ? <Lock size={12}/> : completedLessons.has(lesson.id) ? <CheckCircle size={14} className="text-green-500"/> : <Play size={14}/>}</div>
+                        <span className={`text-xs font-medium tracking-tight ${isActive ? 'text-white' : 'text-zinc-500'}`}>{lesson.title}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+    </div>
+  );
+}

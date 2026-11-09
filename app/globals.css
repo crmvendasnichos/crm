@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #020617; /* Slate 950 (Fundo escuro) */
+  --foreground: #f8fafc; /* Slate 50 (Texto claro) */
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+}
+
+/* Custom Scrollbar - Discreta e Premium */
+::-webkit-scrollbar {
+  width: 5px;  /* Bem fininha */
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent; /* Fundo invisível */
+}
+
+::-webkit-scrollbar-thumb {
+  background: #333; /* Cinza escuro discreto */
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #C9A66B; /* Fica Dourada (MASC PRO) só quando passa o mouse */
+}
+
+.mapa-pin-wrap,
+.leaflet-div-icon.mapa-pin-wrap {
+  background: transparent !important;
+  border: none !important;
+}
+
+.mapa-canvas,
+.mapa-canvas .leaflet-container {
+  height: 100%;
+  width: 100%;
+  background: #e7e2da;
+  font-family: inherit;
+}
+
+.leaflet-container img,
+.leaflet-container canvas {
+  max-width: none !important;
+  max-height: none !important;
+}
+
+/* Para Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #333 transparent;
+}
+
+/* Áreas de rolagem longas (ex.: itens do pedido manual) */
+.scroll-area-pedido {
+  scrollbar-width: auto;
+  scrollbar-color: #555 #1a1a1a;
+}
+.scroll-area-pedido::-webkit-scrollbar {
+  width: 8px;
+}
+.scroll-area-pedido::-webkit-scrollbar-track {
+  background: #1a1a1a;
+  border-radius: 8px;
+}
+.scroll-area-pedido::-webkit-scrollbar-thumb {
+  background: #555;
+  border-radius: 8px;
+}
+.scroll-area-pedido::-webkit-scrollbar-thumb:hover {
+  background: #C9A66B;
+}

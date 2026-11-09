@@ -1,0 +1,214 @@
+import { NextRequest, NextResponse } from "next/server";
+import { getAdminContext } from "@/lib/adminServer";
+import {
+  CRM_LEADS_LIST_SELECT,
+  CRM_LEADS_LIST_SELECT_SEM_TAREFA,
+  CRM_LEADS_LIST_SELECT_LEGACY,
+  parseOrigemLead,
+  parseStatusLead,
+  pickClassificacaoLead,
+  validarProximoPassoProposta,
+  normalizarStatusCrmSimplificado,
+  erroColunaFase2,
+} from "@/lib/comercialClassificacao";
+import { buscarTodasAsPaginas } from "@/lib/crmBuscarTodasPaginas";
+import { camposPessoasSalao, nomeDoSalao } from "@/lib/crmPessoasSalao";
+
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+async function assertCrmAccess(supabase: any, userId: string) {
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("role, full_name")
+    .eq("id", userId)
+    .maybeSingle();
+  if (error) return { ok: false as const, error: error.message };
+  const role = String(data?.role || "").toUpperCase();
+  if (!["ADMIN", "DISTRIBUIDOR"].includes(role)) {
+    return { ok: false as const, error: "Acesso restrito ao CRM." };
+  }
+  return { ok: true as const, role, full_name: data?.full_name as string };
+}
+
+/** Retorna os IDs da rede direta de um distribuidor (quem ele indicou) */
+async function getRedeIds(supabase: any, userId: string): Promise<string[]> {
+  const { data } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("indicado_por", userId);
+  return (data || []).map((p: { id: string }) => p.id);
+}
+
+// GET /api/admin/crm/leads — lista leads (todos ou por status)
+export async function GET(req: NextRequest) {
+  const { supabase, userId, error: authErr, status } = await getAdminContext();
+  if (!supabase || !userId) {
+    return NextResponse.json({ ok: false, error: authErr }, { status });
+  }
+
+  const access = await assertCrmAccess(supabase, userId);
+  if (!access.ok) {
+    return NextResponse.json({ ok: false, error: access.error }, { status: 403 });
+  }
+
+  const { searchParams } = new URL(req.url);
+  const filterStatus    = searchParams.get("status");
+  const busca           = searchParams.get("q");
+  const distribuidorId  = searchParams.get("distribuidor_id"); // filtro exclusivo do ADMIN
+
+  let roleFiltro = "";
+  let todosIdsFiltro: string[] | null = null;
+  let todosIdsRede: string[] | null = null;
+
+  if (access.role === "ADMIN" && distribuidorId) {
+    const { data: filtroPerfil } = await supabase
+      .from("profiles")
+      .select("role")
+      .eq("id", distribuidorId)
+      .maybeSingle();
+    roleFiltro = String(filtroPerfil?.role || "").toUpperCase();
+    if (roleFiltro !== "EMBAIXADOR") {
+      const redeIds = await getRedeIds(supabase, distribuidorId);
+      todosIdsFiltro = [distribuidorId, ...redeIds];
+    }
+  } else if (access.role !== "ADMIN") {
+    const redeIds = await getRedeIds(supabase, userId);
+    todosIdsRede = [userId, ...redeIds];
+  }
+
+  const listar = (select: string) =>
+    buscarTodasAsPaginas((inicio, fim) => {
+      let query = supabase
+        .from("crm_leads")
+        .select(select)
+        .order("updated_at", { ascending: false });
+
+      if (access.role === "ADMIN") {
+        if (distribuidorId) {
+          if (roleFiltro === "EMBAIXADOR") {
+            query = query.or(
+              `created_by.eq.${distribuidorId},responsavel_id.eq.${distribuidorId}`
+            );
+          } else if (todosIdsFiltro) {
+            query = query.or(
+              todosIdsFiltro.map((id) => `created_by.eq.${id},responsavel_id.eq.${id}`).join(",")
+            );
+          }
+        }
+      } else if (todosIdsRede) {
+        query = query.or(
+          todosIdsRede.map((id) => `created_by.eq.${id},responsavel_id.eq.${id}`).join(",")
+        );
+      }
+
+      if (filterStatus) query = query.eq("status", filterStatus);
+      if (busca) {
+        query = query.or(
+          `nome.ilike.%${busca}%,empresa.ilike.%${busca}%,telefone.ilike.%${busca}%,email.ilike.%${busca}%`
+        );
+      }
+
+      return query.range(inicio, fim);
+    });
+
+  let { data, error } = await listar(CRM_LEADS_LIST_SELECT);
+  if (error && /atividade_tipo|atividade_em|schema cache|PGRST204|does not exist/i.test(error)) {
+    const retryTarefa = await listar(CRM_LEADS_LIST_SELECT_SEM_TAREFA);
+    data = retryTarefa.data;
+    error = retryTarefa.error;
+  }
+  if (error && /dono_nome|cabeleireiro|schema cache|PGRST204|does not exist/i.test(error)) {
+    const retry = await listar(CRM_LEADS_LIST_SELECT_LEGACY);
+    data = retry.data;
+    error = retry.error;
+  }
+  if (error) return NextResponse.json({ ok: false, error: erroColunaFase2(error) }, { status: 500 });
+
+  const leads = (data || []).map((lead: any) => ({
+    ...lead,
+    status: normalizarStatusCrmSimplificado(lead.status),
+  }));
+
+  return NextResponse.json({ ok: true, viewer_role: access.role, leads });
+}
+
+// POST /api/admin/crm/leads — cria novo lead
+export async function POST(req: NextRequest) {
+  const { supabase, userId, error: authErr, status } = await getAdminContext();
+  if (!supabase || !userId) {
+    return NextResponse.json({ ok: false, error: authErr }, { status });
+  }
+
+  const access = await assertCrmAccess(supabase, userId);
+  if (!access.ok) {
+    return NextResponse.json({ ok: false, error: access.error }, { status: 403 });
+  }
+
+  const body = await req.json().catch(() => null);
+  if (nomeDoSalao(body) === "Contato") {
+    return NextResponse.json({ ok: false, error: "Informe o salão, o dono ou o cabeleireiro." }, { status: 400 });
+  }
+
+  const statusLead = parseStatusLead(body.status, "novo");
+  if (!statusLead.ok) return NextResponse.json({ ok: false, error: statusLead.error }, { status: 400 });
+  const statusFinal = normalizarStatusCrmSimplificado(statusLead.value);
+  const origem = parseOrigemLead(body.origem, "manual");
+  if (!origem.ok) return NextResponse.json({ ok: false, error: origem.error }, { status: 400 });
+  const classif = pickClassificacaoLead(body);
+  if (classif.error) return NextResponse.json({ ok: false, error: classif.error }, { status: 400 });
+
+  const dataFollowup = body.data_followup || null;
+  const proximoPasso = classif.campos.proximo_passo ?? (body.proximo_passo?.trim() || null);
+  const avancao = validarProximoPassoProposta({
+    status: statusFinal,
+    data_followup: dataFollowup,
+    proximo_passo: proximoPasso,
+  });
+  if (avancao) return NextResponse.json({ ok: false, error: avancao }, { status: 400 });
+
+  const pessoas = camposPessoasSalao(body);
+  const novo = {
+    nome: nomeDoSalao(body),
+    empresa: body.empresa?.trim() || null,
+    telefone: body.telefone?.trim() || pessoas.dono_telefone || pessoas.cabeleireiro_telefone,
+    ...pessoas,
+    email: body.email?.trim() || null,
+    instagram: body.instagram?.trim() || null,
+    cidade: body.cidade?.trim() || null,
+    estado: body.estado?.trim() || null,
+    status: statusFinal,
+    origem: origem.value,
+    valor_estimado: body.valor_estimado ? Number(body.valor_estimado) : null,
+    data_followup: dataFollowup,
+    notas: body.notas?.trim() || null,
+    responsavel_id: body.responsavel_id || userId,
+    created_by: userId,
+    profile_id: body.profile_id || null,
+    ...classif.campos,
+  };
+
+  let ins = await supabase.from("crm_leads").insert(novo).select().single();
+  if (ins.error && /dono_nome|cabeleireiro|schema cache|PGRST204/i.test(ins.error.message)) {
+    const { dono_nome, dono_telefone, cabeleireiro_nome, cabeleireiro_telefone, ...semPessoas } = novo;
+    void dono_nome;
+    void dono_telefone;
+    void cabeleireiro_nome;
+    void cabeleireiro_telefone;
+    ins = await supabase.from("crm_leads").insert(semPessoas).select().single();
+  }
+  const lead = ins.data;
+  const error = ins.error;
+
+  if (error || !lead) return NextResponse.json({ ok: false, error: erroColunaFase2(error?.message || "Falha ao gravar.") }, { status: 500 });
+
+  // Registra atividade de criação
+  await supabase.from("crm_atividades").insert({
+    lead_id: lead.id,
+    autor_id: userId,
+    tipo: "criacao",
+    conteudo: `Lead criado por ${access.full_name || "Admin"}.`,
+  });
+
+  return NextResponse.json({ ok: true, lead });
+}
